@@ -1,0 +1,59 @@
+name: Collect TomTom Traffic Data (Jeddah)
+
+# Runs on GitHub's servers every 10 minutes - your laptop can be off.
+# Also runnable by hand from the Actions tab (workflow_dispatch).
+#
+# SETUP:
+#   1. Put tomtom_collector.py in your repo root.
+#   2. Put this file at .github/workflows/tomtom_collect.yml
+#   3. Repo Settings -> Secrets and variables -> Actions -> New repository
+#      secret, named TOMTOM_API_KEY, with your key as the value.
+#   4. Repo Settings -> Actions -> General -> Workflow permissions ->
+#      select "Read and write permissions" (so it can commit the CSV back).
+#
+# NOTE: GitHub's scheduler is best-effort - a run can be delayed or skipped
+# under load, so expect some gaps. That's normal and fine for this dataset.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# Stops two overlapping runs from both writing the CSV and conflicting.
+concurrency:
+  group: tomtom-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Collect one round
+        env:
+          TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+        run: python tomtom_collector.py --once
+
+      - name: Commit the new rows
+        run: |
+          git config user.name "masar-collector"
+          git config user.email "actions@github.com"
+          git add jeddah_tomtom_flow.csv
+          git diff --cached --quiet && echo "nothing new" && exit 0
+          git commit -m "Traffic data $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # Another run may have pushed while we worked - rebase and retry.
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin ${{ github.ref_name }} && git push && exit 0
+            sleep 5
+          done
+          echo "push failed after retries" && exit 1
