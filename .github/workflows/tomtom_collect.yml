@@ -15,8 +15,6 @@ name: Collect TomTom Traffic Data (Jeddah)
 # under load, so expect some gaps. That's normal and fine for this dataset.
 
 on:
-  schedule:
-    - cron: "3-59/10 * * * *"
   workflow_dispatch:
 
 # Stops two overlapping runs from both writing the CSV and conflicting.
