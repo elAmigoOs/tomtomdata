@@ -1,23 +1,15 @@
 name: Collect TomTom Traffic Data (Jeddah)
 
-# Runs on GitHub's servers every 10 minutes - your laptop can be off.
-# Also runnable by hand from the Actions tab (workflow_dispatch).
-#
-# SETUP:
-#   1. Put tomtom_collector.py in your repo root.
-#   2. Put this file at .github/workflows/tomtom_collect.yml
-#   3. Repo Settings -> Secrets and variables -> Actions -> New repository
-#      secret, named TOMTOM_API_KEY, with your key as the value.
-#   4. Repo Settings -> Actions -> General -> Workflow permissions ->
-#      select "Read and write permissions" (so it can commit the CSV back).
-#
-# NOTE: GitHub's scheduler is best-effort - a run can be delayed or skipped
-# under load, so expect some gaps. That's normal and fine for this dataset.
+# Triggered every 10 minutes by cron-job.org (workflow_dispatch).
+# Each run collects:
+#   1. traffic flow for the 10 monitored points  -> jeddah_tomtom_flow.csv
+#   2. traffic incidents in the same area (1 request) -> jeddah_incidents.csv
+#                                                        jeddah_incidents_runs.csv
 
 on:
   workflow_dispatch:
 
-# Stops two overlapping runs from both writing the CSV and conflicting.
+# Stops two overlapping runs from both writing the CSVs and conflicting.
 concurrency:
   group: tomtom-collect
   cancel-in-progress: false
@@ -37,16 +29,24 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Collect one round
+      - name: Collect traffic flow
         env:
           TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
         run: python tomtom_collector.py --once
+
+      # If the incidents request fails, the flow data is still committed.
+      - name: Collect traffic incidents
+        continue-on-error: true
+        env:
+          TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+        run: python tomtom_incidents.py
 
       - name: Commit the new rows
         run: |
           git config user.name "masar-collector"
           git config user.email "actions@github.com"
           git add jeddah_tomtom_flow.csv
+          git add jeddah_incidents.csv jeddah_incidents_runs.csv 2>/dev/null || true
           git diff --cached --quiet && echo "nothing new" && exit 0
           git commit -m "Traffic data $(date -u +'%Y-%m-%d %H:%M UTC')"
           # Another run may have pushed while we worked - rebase and retry.
