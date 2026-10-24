@@ -1,8 +1,12 @@
 name: Collect TomTom Traffic Data (Jeddah)
 
-# Triggered every 10 minutes by cron-job.org (workflow_dispatch).
+# Triggered every 30 minutes by cron-job.org (workflow_dispatch).
+# TomTom's free limits are MONTHLY: 20,000 flow / 2,500 incident requests.
+# Every 30 min = 1,488 runs in a 31-day month -> 14,880 flow + 1,488 incident
+# requests (python tomtom_collector.py --budget).
 # Each run collects:
 #   1. traffic flow for the 10 monitored points  -> jeddah_tomtom_flow.csv
+#      (fails the run, red, if 0 rows were written)
 #   2. traffic incidents in the same area (1 request) -> jeddah_incidents.csv
 #                                                        jeddah_incidents_runs.csv
 

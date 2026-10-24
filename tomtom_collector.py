@@ -16,9 +16,11 @@ STEP 1 - GET AN API KEY (5 minutes, no credit card)
   3. Paste it below, or better: set it as an environment variable
          export TOMTOM_API_KEY="your_key_here"
 
-  Free tier: 2,500 non-tile requests PER DAY, no card needed.
-  Flow Segment Data counts as a NON-TILE request.
-  Over the limit you get HTTP 429 and requests are blocked, NOT billed.
+  Free tier limits are PER MONTH (not per day), no card needed:
+      Traffic Flow (Flow Segment Data): 20,000 requests / month
+      Incident Details:                  2,500 requests / month
+  Over the limit requests are rejected (HTTP 403 / 429), NOT billed.
+  Check the budget with: python tomtom_collector.py --budget
 
 --------------------------------------------------------------------------
 STEP 2 - VERIFY YOUR POINTS LAND ON THE RIGHT ROADS  (do this first!)
@@ -56,7 +58,10 @@ STEP 4 - RUN IT FOR 6 MONTHS
 --------------------------------------------------------------------------
   Do NOT run this on your laptop - it has to survive reboots and closed
   lids. Use the GitHub Actions workflow (tomtom_collect.yml) that runs it
-  on GitHub's servers every 10 minutes for free.
+  on GitHub's servers every 30 minutes for free.
+
+  --once exits with a non-zero code when no row was written (e.g. the key
+  was rejected or the monthly quota is used up), so the GitHub run turns red.
 
 Requires: pip install requests
 """
@@ -82,7 +87,13 @@ ZOOM = 12            # higher zoom = finer road matching; 10-14 is sensible here
 UNIT = "kmph"
 
 CSV_PATH = "jeddah_tomtom_flow.csv"
-POLL_INTERVAL_MINUTES = 10   # see the budget note at the bottom of this file
+POLL_INTERVAL_MINUTES = 30   # see budget_report(): must fit the MONTHLY free limits
+
+# TomTom free-tier limits, per calendar month.
+FLOW_MONTHLY_LIMIT = 20_000        # Traffic Flow requests (one per point per run)
+INCIDENTS_MONTHLY_LIMIT = 2_500    # Incident Details requests (one per run, tomtom_incidents.py)
+INCIDENT_REQUESTS_PER_RUN = 1
+DAYS_PER_MONTH = 31                # budget for the longest month
 
 SAUDI_TZ = timezone(timedelta(hours=3))
 
@@ -127,8 +138,17 @@ def classify(speed_ratio):
     return "High"
 
 
+class FetchError(RuntimeError):
+    """A failed request. status is the HTTP status code (None for network errors).
+    The message never contains the API key."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 def fetch_point(lat, lon, max_retries=3):
-    """One Flow Segment Data call. Returns the parsed dict, or raises."""
+    """One Flow Segment Data call. Returns the parsed dict, or raises FetchError."""
     url = f"{BASE_URL}/{STYLE}/{ZOOM}/json"
     params = {"key": API_KEY, "point": f"{lat},{lon}", "unit": UNIT}
 
@@ -137,33 +157,35 @@ def fetch_point(lat, lon, max_retries=3):
             r = requests.get(url, params=params, timeout=20)
 
             if r.status_code == 429:
-                # Daily free quota hit, or too fast. Back off, don't hammer.
+                # Quota used up, or too fast. Back off, don't hammer.
                 wait = 60 * (attempt + 1)
-                print(f"    429 rate-limited, waiting {wait}s...", file=sys.stderr)
+                print(f"    HTTP 429 rate-limited, waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
 
             if r.status_code == 403:
-                raise RuntimeError("403 Forbidden - check your API key is valid "
-                                   "and the Traffic API is enabled for it")
+                raise FetchError("HTTP 403 Forbidden - the key was rejected: invalid, Traffic API "
+                                 "not enabled, or the monthly free quota is used up", 403)
 
             if r.status_code == 400:
-                raise RuntimeError("400 - TomTom found no road near this point. "
-                                   "Move the point onto the road itself.")
+                raise FetchError("HTTP 400 - TomTom found no road near this point. "
+                                 "Move the point onto the road itself.", 400)
 
-            r.raise_for_status()
-            data = r.json()["flowSegmentData"]
-            return data
+            if r.status_code != 200:
+                raise FetchError(f"HTTP {r.status_code} from TomTom", r.status_code)
+
+            return r.json()["flowSegmentData"]
 
         except requests.RequestException as e:
             # Never print the raw error: it contains the URL, and the URL
             # contains the API key.
             msg = str(e).replace(API_KEY, "***")
             if attempt == max_retries - 1:
-                raise RuntimeError(msg) from None
+                raise FetchError(f"network error: {msg}") from None
             time.sleep(5 * (attempt + 1))
 
-    raise RuntimeError("exhausted retries (still rate-limited)")
+    raise FetchError(f"HTTP 429 - still rate-limited after {max_retries} tries "
+                     "(monthly quota used up, or too many requests per second)", 429)
 
 
 def segment_mid(d, lat, lon):
@@ -276,9 +298,15 @@ def collect_once():
                      "Delete it (or rename it) and run again, otherwise rows will misalign.")
 
     rows, ok, failed = [], 0, 0
+    statuses = {}          # HTTP status (or "network") -> number of failed points
+    key_rejected = False   # after a 403/429 every other point would fail the same way
 
     for road, points in ROADS.items():
         for i, (lat, lon) in enumerate(points, 1):
+            if key_rejected:
+                failed += 1
+                statuses["skipped"] = statuses.get("skipped", 0) + 1
+                continue
             try:
                 d = fetch_point(lat, lon)
 
@@ -319,8 +347,17 @@ def collect_once():
                 ok += 1
 
             except Exception as e:
-                print(f"  {road} p{i}: FAILED - {e}", file=sys.stderr)
+                status = getattr(e, "status", None)
+                print(f"  {road} p{i}: FAILED (HTTP {status or 'n/a'}) - {e}", file=sys.stderr)
                 failed += 1
+                key = status or "network"
+                statuses[key] = statuses.get(key, 0) + 1
+                if status in (403, 429):
+                    # The key or its quota is the problem: the remaining points
+                    # would fail too, and each 429 retry waits minutes.
+                    key_rejected = True
+                    print("  Skipping the remaining points this run (key rejected or quota used up).",
+                          file=sys.stderr)
 
             time.sleep(0.3)   # keep under the free-tier QPS limit
 
@@ -331,23 +368,37 @@ def collect_once():
                 w.writeheader()
             w.writerows(rows)
 
-    print(f"[{now_local:%Y-%m-%d %H:%M}] wrote {ok} rows"
-          + (f", {failed} failed" if failed else ""))
+    total = ok + failed
+    print(f"[{now_local:%Y-%m-%d %H:%M}] wrote {ok} of {total} rows"
+          + (f", {failed} failed ({', '.join(f'{k}: {v}' for k, v in statuses.items())})" if failed else ""))
     return ok, failed
 
 
 def budget_report():
+    """Requests per month against TomTom's MONTHLY free limits (31-day month)."""
     points = sum(len(p) for p in ROADS.values())
-    per_day = points * (24 * 60 // POLL_INTERVAL_MINUTES)
-    print(f"{points} points x every {POLL_INTERVAL_MINUTES} min "
-          f"= {per_day:,} requests/day (free tier allows 2,500/day)")
-    if per_day > 2500:
-        print("  !! OVER THE FREE LIMIT - increase POLL_INTERVAL_MINUTES "
-              "or remove some points, or you'll get 429s partway through each day.")
+    runs_per_day = 24 * 60 // POLL_INTERVAL_MINUTES
+    runs_per_month = runs_per_day * DAYS_PER_MONTH
+    budgets = [
+        ("Traffic Flow", points, FLOW_MONTHLY_LIMIT),
+        ("Incident Details", INCIDENT_REQUESTS_PER_RUN, INCIDENTS_MONTHLY_LIMIT),
+    ]
+    print(f"One run every {POLL_INTERVAL_MINUTES} min = {runs_per_day} runs/day "
+          f"= {runs_per_month:,} runs in a {DAYS_PER_MONTH}-day month")
+    over = False
+    for name, per_run, limit in budgets:
+        per_month = per_run * runs_per_month
+        headroom = limit - per_month
+        print(f"  {name:<17}: {per_run} request(s)/run x {runs_per_month:,} = {per_month:,} requests/month "
+              f"(free limit {limit:,}/month) -> headroom {headroom:,}")
+        over |= headroom < 0
+    if over:
+        print("  !! OVER A FREE LIMIT - increase POLL_INTERVAL_MINUTES or remove some points, "
+              "or the quota runs out before the month ends and every request is rejected.")
     else:
-        print(f"  OK - {2500 - per_day:,} requests/day of headroom.")
-    print(f"  6 months of collection ~= {per_day * 180:,} requests, "
-          f"{per_day * 180 // points:,} readings per point.")
+        print("  OK - both fit the monthly free limits.")
+    print(f"  6 months of collection ~= {runs_per_day * 180 * points:,} flow requests, "
+          f"{runs_per_day * 180:,} readings per point.")
 
 
 if __name__ == "__main__":
@@ -357,18 +408,26 @@ if __name__ == "__main__":
     ap.add_argument("--once", action="store_true",
                     help="collect a single round and exit (use this with cron)")
     ap.add_argument("--budget", action="store_true",
-                    help="print the daily request budget and exit")
+                    help="print the monthly request budget and exit (needs no API key)")
     args = ap.parse_args()
+
+    if args.budget:
+        budget_report()
+        sys.exit(0)
 
     if API_KEY == "PASTE_YOUR_KEY_HERE":
         sys.exit("No API key. Set TOMTOM_API_KEY or edit API_KEY in this file.")
 
-    if args.budget:
-        budget_report()
-    elif args.verify:
+    if args.verify:
         verify()
     elif args.once:
-        collect_once()
+        written, failed = collect_once()
+        if written == 0:
+            # Nothing collected: fail the run so GitHub Actions shows it in red.
+            sys.exit(f"ERROR: 0 rows written ({failed} point(s) failed) - nothing was collected.")
+        if failed:
+            print(f"WARNING: {failed} of {written + failed} points failed this run; "
+                  f"{written} rows were written.")
     else:
         budget_report()
         print(f"\nCollecting every {POLL_INTERVAL_MINUTES} min into {CSV_PATH}. Ctrl+C to stop.\n")
